@@ -1,68 +1,479 @@
-# Prerequisites
-*.d
+// TriageIQ: First Sick, First Served
+// Smart ER triage + resource allocation engine (standard C++17, no libraries)
+//
+// Build:  g++ -std=c++17 -O2 -Wall -o triageiq triageiq.cpp
+// Run:    ./triageiq sim [patients] [avgGapMinutes] [seed]    (compare TriageIQ vs first-come-first-served)
+//         ./triageiq live                                     (interactive ER demo, exports state.json)
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+#include <algorithm>
+#include <cstdio>
+#include <iostream>
+#include <map>
+#include <queue>
+#include <random>
+#include <set>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <vector>
+#include <fstream>
 
-# Precompiled Headers
-*.gch
-*.pch
+using namespace std;
 
-# Linker files
-*.ilk
+// ---------------------------------------------------------------- tunable policy
+const int AGING_PER_MIN = 2;   // score points gained per minute of waiting (anti-starvation)
+const int MAX_WAIT_MIN  = 180; // hard cap: anyone waiting longer than this is served first
 
-# Debugger Files
-*.pdb
+enum Policy { FCFS, TRIAGE };
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
+// ---------------------------------------------------------------- data model
+struct Patient {
+    int id = 0;
+    string name;
+    int age = 30;
+    int severity = 5;          // 1 = critical ... 5 = mild
+    bool pregnant = false;
+    string complaint;
+    string specialty = "GENERAL";   // doctor specialty needed
+    vector<string> equipment;       // equipment the bed must have
+    int arrival = 0;                // minutes
+    int duration = 30;              // treatment time in minutes
+    int start = -1;                 // -1 means still waiting
+    int end = -1;
+    int bed = -1;
+    int doctor = -1;
+};
 
-# Fortran module files
-*.mod
-*.smod
+struct Bed {
+    int id;
+    string name;
+    int rank;                  // 0 = GENERAL, 1 = TRAUMA, 2 = ICU
+    set<string> equipment;
+    bool free = true;
+    int busyMinutes = 0;
+};
 
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+struct Doctor {
+    int id;
+    string name;
+    string specialty;          // CARDIO, TRAUMA, GENERAL
+    bool free = true;
+};
 
-# Executables
-*.exe
-*.out
-*.app
+// What a patient can be generated with (used for simulation and live demo)
+struct Complaint {
+    string name;
+    int minSev, maxSev;
+    string specialty;
+    vector<string> equipment;
+    int minDur, maxDur;
+};
 
-# Build directories
-build/
-Build/
-build-*/
+const vector<Complaint> COMPLAINTS = {
+    {"Chest pain",          1, 2, "CARDIO",  {"ECG"},         40, 90},
+    {"Severe injury",       1, 2, "TRAUMA",  {"XRAY"},        50, 100},
+    {"Breathing problem",   1, 3, "GENERAL", {"MONITOR"},     40, 80},
+    {"Fracture",            2, 3, "TRAUMA",  {"XRAY"},        30, 60},
+    {"High fever",          3, 4, "GENERAL", {},              20, 40},
+    {"Stomach pain",        3, 4, "GENERAL", {},              20, 40},
+    {"Sprain",              4, 5, "GENERAL", {},              15, 30},
+    {"Minor cut",           5, 5, "GENERAL", {},              10, 20},
+};
 
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
+// ---------------------------------------------------------------- scoring
+int riskBonus(const Patient& p) {
+    int bonus = 0;
+    if (p.age <= 5 || p.age >= 60) bonus = max(bonus, 30);
+    if (p.pregnant) bonus = max(bonus, 30);
+    return bonus;
+}
 
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
+// Base score = severity weight + risk bonus (higher = more urgent)
+int baseScore(const Patient& p) { return (6 - p.severity) * 100 + riskBonus(p); }
 
-# vcpkg
-vcpkg_installed/
+// Aging trick: live score = base + AGING*(now - arrival) = (base - AGING*arrival) + AGING*now.
+// The AGING*now part is identical for everyone, so the heap only needs the static key below.
+// The heap never has to be rebuilt as time passes.
+int heapKey(const Patient& p) { return baseScore(p) - AGING_PER_MIN * p.arrival; }
 
-# debug information files
-*.dwo
+int liveScore(const Patient& p, int now) { return baseScore(p) + AGING_PER_MIN * (now - p.arrival); }
 
-# test output & cache
-Testing/
-.cache/
+int requiredBedRank(const Patient& p) { return p.severity == 1 ? 2 : (p.severity == 2 ? 1 : 0); }
+
+// ---------------------------------------------------------------- the hospital (engine)
+class Hospital {
+public:
+    Policy policy;
+    int now = 0;
+    vector<Patient> patients;   // indexed by id
+    vector<Bed> beds;
+    vector<Doctor> doctors;
+
+    explicit Hospital(Policy p) : policy(p) {
+        // Default ER layout
+        addBed("ICU-1",    2, {"VENTILATOR", "ECG", "MONITOR", "XRAY"});
+        addBed("ICU-2",    2, {"VENTILATOR", "ECG", "MONITOR", "XRAY"});
+        addBed("TRAUMA-1", 1, {"MONITOR", "XRAY", "ECG"});
+        addBed("TRAUMA-2", 1, {"MONITOR", "XRAY"});
+        addBed("TRAUMA-3", 1, {"MONITOR", "XRAY"});
+        for (int i = 1; i <= 3; i++) addBed("GEN-" + to_string(i), 0, {"MONITOR"});
+        addDoctor("Dr. Cardio-1", "CARDIO");
+        addDoctor("Dr. Cardio-2", "CARDIO");
+        addDoctor("Dr. Trauma-1", "TRAUMA");
+        addDoctor("Dr. Trauma-2", "TRAUMA");
+        for (int i = 1; i <= 2; i++) addDoctor("Dr. General-" + to_string(i), "GENERAL");
+    }
+
+    void addBed(const string& name, int rank, const set<string>& eq) {
+        Bed b; b.id = (int)beds.size(); b.name = name; b.rank = rank; b.equipment = eq;
+        beds.push_back(b);
+    }
+    void addDoctor(const string& name, const string& spec) {
+        Doctor d; d.id = (int)doctors.size(); d.name = name; d.specialty = spec;
+        doctors.push_back(d);
+    }
+
+    // A new patient walks in right now
+    int addPatient(Patient p) {
+        p.id = (int)patients.size();
+        p.arrival = now;
+        patients.push_back(p);
+        waitingByArrival.insert({p.arrival, p.id});
+        heap.push(make_tuple(heapKey(p), -p.arrival, -p.id));
+        allocate();
+        return p.id;
+    }
+
+    // Move the clock forward, processing every discharge on the way
+    void advanceTo(int t) {
+        while (!discharges.empty() && discharges.top().first <= t) {
+            int when = discharges.top().first;
+            int id = discharges.top().second;
+            discharges.pop();
+            now = max(now, when);
+            Patient& p = patients[id];
+            beds[p.bed].free = true;
+            beds[p.bed].busyMinutes += p.duration;
+            doctors[p.doctor].free = true;
+            allocate();   // a resource just freed up
+        }
+        now = max(now, t);
+    }
+
+    void drain() {   // run until everyone has been treated
+        while (!discharges.empty()) advanceTo(discharges.top().first);
+    }
+
+    // Who is waiting, most urgent first (for the dashboard)
+    vector<int> waitingSorted() const {
+        vector<int> ids;
+        for (auto& pr : waitingByArrival) ids.push_back(pr.second);
+        if (policy == TRIAGE) {
+            sort(ids.begin(), ids.end(), [&](int a, int b) {
+                int sa = liveScore(patients[a], now), sb = liveScore(patients[b], now);
+                if (sa != sb) return sa > sb;
+                return patients[a].arrival < patients[b].arrival;
+            });
+        }
+        return ids;
+    }
+
+private:
+    set<pair<int, int>> waitingByArrival;                  // (arrival, id) of everyone waiting
+    priority_queue<tuple<int, int, int>> heap;             // max-heap on (key, earlier arrival, lower id)
+    priority_queue<pair<int, int>, vector<pair<int, int>>, greater<pair<int, int>>> discharges; // (endTime, id)
+
+    bool anyFree() const {
+        bool b = false, d = false;
+        for (auto& x : beds) if (x.free) { b = true; break; }
+        for (auto& x : doctors) if (x.free) { d = true; break; }
+        return b && d;
+    }
+
+    // Best-fit bed: smallest rank that satisfies the need, then least extra equipment
+    int findBed(const Patient& p) const {
+        int best = -1;
+        for (auto& b : beds) {
+            if (!b.free || b.rank < requiredBedRank(p)) continue;
+            // TriageIQ protects scarce beds: ICU only for severity 1-2, trauma only for severity 1-3
+            if (policy == TRIAGE && b.rank == 2 && p.severity > 2) continue;
+            if (policy == TRIAGE && b.rank == 1 && p.severity > 3) continue;
+            bool ok = true;
+            for (auto& e : p.equipment) if (!b.equipment.count(e)) { ok = false; break; }
+            if (!ok) continue;
+            if (best == -1 ||
+                make_pair(b.rank, (int)b.equipment.size()) < make_pair(beds[best].rank, (int)beds[best].equipment.size()))
+                best = b.id;
+        }
+        return best;
+    }
+
+    // Best-fit doctor: exact specialty first; a specialist may cover GENERAL cases only
+    int findDoctor(const Patient& p) const {
+        int best = -1, bestScore = 99;
+        for (auto& d : doctors) {
+            if (!d.free) continue;
+            int s;
+            if (d.specialty == p.specialty) s = 0;
+            else if (p.specialty == "GENERAL" && (policy == FCFS || p.severity <= 3)) s = 1;   // TriageIQ keeps specialists free for severe cases
+            else continue;
+            if (s < bestScore) { best = d.id; bestScore = s; }
+        }
+        return best;
+    }
+
+    // Match bed + doctor together; start treatment only if both fit
+    bool tryAssign(int id) {
+        Patient& p = patients[id];
+        int b = findBed(p);
+        if (b == -1) return false;
+        int d = findDoctor(p);
+        if (d == -1) return false;
+        beds[b].free = false;
+        doctors[d].free = false;
+        p.bed = b; p.doctor = d;
+        p.start = now; p.end = now + p.duration;
+        waitingByArrival.erase({p.arrival, p.id});
+        discharges.push({p.end, p.id});
+        return true;
+    }
+
+    void allocate() {
+        if (!anyFree()) return;
+
+        if (policy == FCFS) {
+            // Baseline: oldest first; patients who cannot be matched yet are skipped (fair, non-blocking)
+            vector<int> order;
+            for (auto& pr : waitingByArrival) order.push_back(pr.second);
+            for (int id : order) { if (!anyFree()) break; tryAssign(id); }
+            return;
+        }
+
+        // 1) Fairness cap: anyone over MAX_WAIT_MIN goes first, oldest first
+        vector<int> overdue;
+        for (auto& pr : waitingByArrival) {
+            if (now - pr.first < MAX_WAIT_MIN) break;   // set is ordered by arrival
+            overdue.push_back(pr.second);
+        }
+        for (int id : overdue) { if (!anyFree()) return; tryAssign(id); }
+
+        // 2) Priority heap: most urgent first. Unmatched patients keep their place.
+        vector<tuple<int, int, int>> skipped;
+        while (!heap.empty() && anyFree()) {
+            auto top = heap.top(); heap.pop();
+            int id = -get<2>(top);
+            if (patients[id].start != -1) continue;    // already treated via the fairness cap
+            if (!tryAssign(id)) skipped.push_back(top);
+        }
+        for (auto& s : skipped) heap.push(s);
+    }
+};
+
+// ---------------------------------------------------------------- patient generator
+vector<Patient> generatePatients(int n, double avgGap, unsigned seed) {
+    mt19937 rng(seed);
+    exponential_distribution<double> gap(1.0 / avgGap);
+    uniform_int_distribution<int> pickComplaint(0, (int)COMPLAINTS.size() - 1);
+    uniform_int_distribution<int> ageDist(1, 90);
+    uniform_real_distribution<double> unit(0.0, 1.0);
+
+    vector<Patient> out;
+    double t = 0;
+    for (int i = 0; i < n; i++) {
+        t += gap(rng);
+        const Complaint& c = COMPLAINTS[pickComplaint(rng)];
+        Patient p;
+        p.name = "P" + to_string(i + 1);
+        p.age = ageDist(rng);
+        p.pregnant = (p.age >= 18 && p.age <= 40 && unit(rng) < 0.05);
+        p.complaint = c.name;
+        p.severity = uniform_int_distribution<int>(c.minSev, c.maxSev)(rng);
+        p.specialty = c.specialty;
+        p.equipment = c.equipment;
+        p.duration = uniform_int_distribution<int>(c.minDur, c.maxDur)(rng);
+        p.arrival = (int)t;
+        out.push_back(p);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- simulation + metrics
+struct Result {
+    double avgWaitCritical = 0, avgWaitAll = 0, utilization = 0, avgWaitSev1 = 0, avgWaitMild = 0;
+    int maxWait = 0, maxWaitCritical = 0, overCap = 0, makespan = 0, served = 0, unserved = 0;
+};
+
+Result simulate(Policy policy, const vector<Patient>& input) {
+    Hospital h(policy);
+    for (const Patient& p : input) {
+        h.advanceTo(p.arrival);
+        h.addPatient(p);
+    }
+    h.drain();
+
+    Result r;
+    double sumAll = 0, sumCrit = 0, sumS1 = 0, sumMild = 0;
+    int nCrit = 0, nS1 = 0, nMild = 0;
+    for (const Patient& p : h.patients) {
+        if (p.start == -1) { r.unserved++; continue; }   // no bed/doctor in the hospital can ever fit this patient
+        int w = p.start - p.arrival;
+        sumAll += w;
+        r.maxWait = max(r.maxWait, w);
+        if (w > MAX_WAIT_MIN) r.overCap++;
+        if (p.severity == 1) { sumS1 += w; nS1++; }
+        if (p.severity >= 4) { sumMild += w; nMild++; }
+        if (p.severity <= 2) { sumCrit += w; nCrit++; r.maxWaitCritical = max(r.maxWaitCritical, w); }
+        r.makespan = max(r.makespan, p.end);
+        r.served++;
+    }
+    r.avgWaitAll = r.served ? sumAll / r.served : 0;
+    r.avgWaitCritical = nCrit ? sumCrit / nCrit : 0;
+    r.avgWaitSev1 = nS1 ? sumS1 / nS1 : 0;
+    r.avgWaitMild = nMild ? sumMild / nMild : 0;
+    double busy = 0;
+    for (auto& b : h.beds) busy += b.busyMinutes;
+    r.utilization = (r.makespan > 0) ? 100.0 * busy / ((double)h.beds.size() * r.makespan) : 0;
+    return r;
+}
+
+void runSimulation(int n, double gap, unsigned seed) {
+    vector<Patient> input = generatePatients(n, gap, seed);
+    Result f = simulate(FCFS, input);
+    Result t = simulate(TRIAGE, input);
+
+    printf("\nSurge simulation: %d patients, avg gap %.1f min, seed %u\n", n, gap, seed);
+    Hospital probe(FCFS);
+    printf("Resources: %zu beds (2 ICU, 3 trauma, 3 general), %zu doctors (2 cardio, 2 trauma, 2 general)\n\n", probe.beds.size(), probe.doctors.size());
+    printf("%-38s %12s %12s\n", "Metric", "First-come", "TriageIQ");
+    printf("%-38s %12s %12s\n", "------", "----------", "--------");
+    printf("%-38s %12.1f %12.1f\n", "Avg wait, critical patients (min)", f.avgWaitCritical, t.avgWaitCritical);
+    printf("%-38s %12.1f %12.1f\n", "Avg wait, severity 1 only (min)", f.avgWaitSev1, t.avgWaitSev1);
+    printf("%-38s %12.1f %12.1f\n", "Avg wait, mild severity 4-5 (min)", f.avgWaitMild, t.avgWaitMild);
+    printf("%-38s %12d %12d\n",     "Max wait, critical patients (min)", f.maxWaitCritical, t.maxWaitCritical);
+    printf("%-38s %12.1f %12.1f\n", "Avg wait, all patients (min)", f.avgWaitAll, t.avgWaitAll);
+    printf("%-38s %12d %12d\n",     "Max wait, any patient (min)", f.maxWait, t.maxWait);
+    printf("%-38s %12d %12d\n",     "Patients waiting over cap", f.overCap, t.overCap);
+    printf("%-38s %11.1f%% %11.1f%%\n", "Bed utilization", f.utilization, t.utilization);
+    if (f.unserved || t.unserved)
+        printf("\nWARNING: %d / %d patients could never be matched to a bed and doctor. Check the hospital layout.\n", f.unserved, t.unserved);
+    if (f.avgWaitCritical > 0) {
+        double cut = 100.0 * (f.avgWaitCritical - t.avgWaitCritical) / f.avgWaitCritical;
+        if (cut >= 0) printf("\nCritical patients wait %.0f%% less with TriageIQ.\n", cut);
+        else printf("\nIn this run TriageIQ did not reduce critical waits (%.0f%% more). Try another load or seed.\n", -cut);
+    }
+}
+
+// ---------------------------------------------------------------- live demo + JSON export
+string jsonEscape(const string& s) {
+    string o;
+    for (char c : s) { if (c == '"' || c == '\\') o += '\\'; o += c; }
+    return o;
+}
+
+void exportJson(const Hospital& h, const string& path) {
+    ofstream f(path);
+    f << "{\n  \"time\": " << h.now << ",\n  \"waiting\": [";
+    bool first = true;
+    for (int id : h.waitingSorted()) {
+        const Patient& p = h.patients[id];
+        f << (first ? "\n" : ",\n") << "    {\"id\": " << p.id << ", \"name\": \"" << jsonEscape(p.name)
+          << "\", \"severity\": " << p.severity << ", \"complaint\": \"" << jsonEscape(p.complaint)
+          << "\", \"score\": " << liveScore(p, h.now) << ", \"waited\": " << (h.now - p.arrival) << "}";
+        first = false;
+    }
+    f << "\n  ],\n  \"beds\": [";
+    for (size_t i = 0; i < h.beds.size(); i++) {
+        const Bed& b = h.beds[i];
+        string who = "";
+        for (const Patient& p : h.patients) if (p.bed == b.id && p.start != -1 && p.end > h.now) who = p.name;
+        f << (i ? ",\n" : "\n") << "    {\"name\": \"" << b.name << "\", \"free\": " << (b.free ? "true" : "false")
+          << ", \"patient\": \"" << jsonEscape(who) << "\"}";
+    }
+    f << "\n  ],\n  \"doctors\": [";
+    for (size_t i = 0; i < h.doctors.size(); i++) {
+        const Doctor& d = h.doctors[i];
+        f << (i ? ",\n" : "\n") << "    {\"name\": \"" << d.name << "\", \"specialty\": \"" << d.specialty
+          << "\", \"free\": " << (d.free ? "true" : "false") << "}";
+    }
+    f << "\n  ]\n}\n";
+}
+
+void showState(const Hospital& h) {
+    printf("\n=== ER state at minute %d ===\n", h.now);
+    printf("Waiting queue (most urgent first):\n");
+    vector<int> w = h.waitingSorted();
+    if (w.empty()) printf("  (empty)\n");
+    for (int id : w) {
+        const Patient& p = h.patients[id];
+        printf("  #%d %-8s sev %d  %-18s needs %-7s score %4d  waited %d min\n",
+               p.id, p.name.c_str(), p.severity, p.complaint.c_str(), p.specialty.c_str(),
+               liveScore(p, h.now), h.now - p.arrival);
+    }
+    printf("Beds:\n");
+    for (const Bed& b : h.beds) {
+        string who = "-";
+        for (const Patient& p : h.patients) if (p.bed == b.id && p.start != -1 && p.end > h.now) who = p.name;
+        printf("  %-9s %s %s\n", b.name.c_str(), b.free ? "FREE    " : "OCCUPIED", b.free ? "" : who.c_str());
+    }
+    printf("Doctors:\n");
+    for (const Doctor& d : h.doctors) printf("  %-14s %s\n", d.name.c_str(), d.free ? "free" : "busy");
+}
+
+void liveMode() {
+    Hospital h(TRIAGE);
+    printf("TriageIQ live demo. Commands: add, wait <minutes>, show, json, quit\n");
+    string line;
+    while (true) {
+        printf("\n> ");
+        if (!getline(cin, line)) break;
+        stringstream ss(line);
+        string cmd; ss >> cmd;
+        if (cmd == "quit" || cmd == "exit") break;
+
+        if (cmd == "add") {
+            Patient p;
+            printf("Name: "); getline(cin, p.name);
+            printf("Age: ");  { string s; getline(cin, s); try { p.age = stoi(s); } catch (...) { p.age = 30; } }
+            printf("Pregnant? (y/n): "); { string s; getline(cin, s); p.pregnant = (!s.empty() && (s[0] == 'y' || s[0] == 'Y')); }
+            printf("Complaint:\n");
+            for (size_t i = 0; i < COMPLAINTS.size(); i++)
+                printf("  %zu) %s (severity %d-%d)\n", i + 1, COMPLAINTS[i].name.c_str(), COMPLAINTS[i].minSev, COMPLAINTS[i].maxSev);
+            int pick = 1; { string s; printf("Choose: "); getline(cin, s); try { pick = stoi(s); } catch (...) {} }
+            pick = max(1, min((int)COMPLAINTS.size(), pick));
+            const Complaint& c = COMPLAINTS[pick - 1];
+            printf("Severity (1 critical - 5 mild) [%d-%d]: ", c.minSev, c.maxSev);
+            int sev = c.maxSev; { string s; getline(cin, s); try { sev = stoi(s); } catch (...) {} }
+            p.severity = max(1, min(5, sev));
+            p.complaint = c.name; p.specialty = c.specialty; p.equipment = c.equipment;
+            p.duration = (c.minDur + c.maxDur) / 2;
+            int id = h.addPatient(p);
+            const Patient& q = h.patients[id];
+            if (q.start != -1) printf("Patient #%d assigned immediately: bed %s, %s\n", id, h.beds[q.bed].name.c_str(), h.doctors[q.doctor].name.c_str());
+            else printf("Patient #%d added to the queue with score %d\n", id, liveScore(q, h.now));
+        } else if (cmd == "wait") {
+            int m = 0; ss >> m;
+            if (m <= 0) { printf("Usage: wait <minutes>\n"); continue; }
+            h.advanceTo(h.now + m);
+            printf("Advanced to minute %d\n", h.now);
+        } else if (cmd == "show") {
+            showState(h);
+        } else if (cmd == "json") {
+            exportJson(h, "state.json");
+            printf("Wrote state.json\n");
+        } else if (!cmd.empty()) {
+            printf("Unknown command. Use: add, wait <minutes>, show, json, quit\n");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- main
+int main(int argc, char** argv) {
+    string mode = (argc > 1) ? argv[1] : "sim";
+    if (mode == "live") { liveMode(); return 0; }
+    int n = (argc > 2) ? atoi(argv[2]) : 200;
+    double gap = (argc > 3) ? atof(argv[3]) : 5.0;
+    unsigned seed = (argc > 4) ? (unsigned)atoi(argv[4]) : 42;
+    if (n <= 0 || gap <= 0) { printf("Usage: %s sim [patients>0] [avgGapMin>0] [seed]\n", argv[0]); return 1; }
+    runSimulation(n, gap, seed);
+    return 0;
+}
