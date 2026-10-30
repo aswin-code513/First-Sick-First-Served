@@ -1,10 +1,4 @@
-// TriageIQ: First Sick, First Served
-// Smart ER triage + resource allocation engine (standard C++17, no libraries)
-//
-// Build:  g++ -std=c++17 -O2 -Wall -o triageiq triageiq.cpp
-// Run:    ./triageiq sim [patients] [avgGapMinutes] [seed]    (compare TriageIQ vs first-come-first-served)
-//         ./triageiq live                                     (interactive ER demo, exports state.json)
-
+// TriageIQ: First Sick, First Serve
 #include <algorithm>
 #include <cstdio>
 #include <iostream>
